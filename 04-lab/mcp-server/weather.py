@@ -3,6 +3,10 @@ import asyncio
 import httpx
 import os
 from mcp.server.fastmcp import FastMCP
+from dotenv import load_dotenv
+
+# Load local configuration from mcp-server/.env when running in development.
+load_dotenv()
 
 # Initialize FastMCP server
 port = int(os.getenv("PORT", 8085))

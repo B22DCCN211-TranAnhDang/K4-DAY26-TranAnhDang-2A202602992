@@ -1,49 +1,78 @@
-"""Minh hoạ FUNCTION CALLING thuần với Google Gemini SDK.
+# cspell: disable
+"""Minh hoạ Function Calling qua OpenRouter.
 
-Tool `get_weather` được định nghĩa schema thủ công VÀ thực thi ngay trong
-chính file app này. Model chỉ QUYẾT ĐỊNH gọi tool nào; app mới là nơi chạy.
+Model chỉ quyết định gọi tool nào; app Python mới là nơi thực thi tool.
 
-Cách chạy:
-    pip install -r ../requirements.txt
-    export GEMINI_API_KEY=...
+Cách chạy (PowerShell):
+    $env:OPENROUTER_API_KEY="..."
     python weather_function_calling.py
 """
 
-from google import genai
-from google.genai import types
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
 
-client = genai.Client()
+from openai import OpenAI
 
-MODEL = "gemini-2.5-flash"
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+
+def load_local_env() -> None:
+    """Đọc file .env cùng thư mục mà không ghi đè biến môi trường đã có."""
+    env_file = Path(__file__).with_name(".env")
+    if not env_file.exists():
+        return
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        os.environ.setdefault(name.strip(), value.strip())
+
+
+load_local_env()
+MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 
 SYSTEM_INSTRUCTION = (
     "Bạn là trợ lý thời tiết thân thiện, trả lời bằng tiếng Việt tự nhiên. "
+    "Khi người dùng hỏi về thời tiết của một hoặc nhiều thành phố, hãy gọi công cụ get_weather "
+    "cho từng thành phố được hỏi. "
     "Dùng emoji phù hợp (🌧️ 🌤️ 💨 💧). "
     "Tóm tắt ngắn gọn, dễ hiểu, và đưa ra lời khuyên thực tế "
     "(ví dụ: mang ô, mặc áo mỏng, ...)."
 )
 
-# 1. App tự định nghĩa schema của tool
-get_weather_declaration = types.FunctionDeclaration(
-    name="get_weather",
-    description="Lấy thời tiết hiện tại của một thành phố",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "city": types.Schema(
-                type=types.Type.STRING, description="Tên thành phố"
-            )
+# 1. App tự định nghĩa schema của tool. OpenRouter dùng schema tương thích OpenAI.
+GET_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Lấy thời tiết hiện tại của một thành phố",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "Tên thành phố",
+                }
+            },
+            "required": ["city"],
+            "additionalProperties": False,
         },
-        required=["city"],
-    ),
-)
+    },
+}
 
-TOOLS = [types.Tool(function_declarations=[get_weather_declaration])]
+TOOLS: list[Any] = [GET_WEATHER_TOOL]
 
 
-# 2. App tự thực thi tool (trong thực tế sẽ gọi API thời tiết thật)
+# 2. App tự thực thi tool (trong thực tế sẽ gọi API thời tiết thật).
 def get_weather(city: str) -> str:
-    """Trả về thời tiết (mock) của *city*. Dùng làm tool cho model."""
+    """Trả về thời tiết mock của *city*. Dùng làm tool cho model."""
     mock_data = {
         "Hà Nội": {
             "nhiệt_độ": "29°C",
@@ -64,57 +93,68 @@ def get_weather(city: str) -> str:
             "gió": {"hướng": "Đông", "tốc_độ": "10 km/h"},
         },
     }
-    import json
 
     default = {"nhiệt_độ": "28°C", "thời_tiết": "không có dữ liệu chi tiết"}
     return json.dumps({"city": city, **mock_data.get(city, default)}, ensure_ascii=False)
 
 
 def run(prompt: str) -> str:
-    """Gửi *prompt* tới Gemini, tự động xử lý function calling và trả về câu trả lời cuối."""
-    contents: list[types.Content] = [
-        types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+    """Gửi prompt tới OpenRouter và xử lý vòng lặp function calling."""
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("Chưa đặt biến môi trường OPENROUTER_API_KEY")
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    messages: list[Any] = [
+        {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "user", "content": prompt},
     ]
 
-    # 3. Gọi model — model quyết định có gọi tool hay không
-    resp = client.models.generate_content(
+    response = client.chat.completions.create(
         model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            tools=TOOLS,
-            system_instruction=SYSTEM_INSTRUCTION,
-        ),
+        messages=messages,
+        tools=TOOLS,
+        tool_choice="auto",
     )
+    message = response.choices[0].message
 
-    # 4. Vòng lặp: nếu model yêu cầu tool, app TỰ THỰC THI rồi đưa kết quả trả lại
-    while resp.function_calls:
-        # Thêm phản hồi của model vào lịch sử hội thoại
-        contents.append(resp.candidates[0].content)
+    # 3. Model yêu cầu tool; app tự chạy hàm rồi gửi kết quả lại model.
+    while message.tool_calls:
+        messages.append(message.model_dump(exclude_none=True))
 
-        function_responses = []
-        for fc in resp.function_calls:
-            print(f"  [model yêu cầu] {fc.name}({fc.args})")
-            result = get_weather(**fc.args)  # <-- app chạy, không phải model
+        for tool_call in message.tool_calls:
+            if tool_call.type != "function":
+                continue
+            name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
+            print(f"  [model yêu cầu] {name}({args})")
+
+            if name != "get_weather":
+                result = json.dumps({"error": f"Tool không được hỗ trợ: {name}"})
+            else:
+                result = get_weather(city=str(args["city"]))
+
             print(f"  [app thực thi]  -> {result}")
-            function_responses.append(
-                types.Part.from_function_response(
-                    name=fc.name, response={"result": result}
-                )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                }
             )
 
-        # Gửi kết quả tool trả về cho model
-        contents.append(types.Content(role="user", parts=function_responses))
-        resp = client.models.generate_content(
+        response = client.chat.completions.create(
             model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                tools=TOOLS,
-                system_instruction=SYSTEM_INSTRUCTION,
-            ),
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
         )
+        message = response.choices[0].message
 
-    # 5. Model tổng hợp câu trả lời cuối
-    return resp.text
+    return message.content or "Model không trả về nội dung."
 
 
 if __name__ == "__main__":
